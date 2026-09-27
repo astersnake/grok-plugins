@@ -1,0 +1,24 @@
+{
+  "name": "grok-plugins",
+  "description": "Grok plugins by astersnake.",
+  "owner": {
+    "name": "astersnake"
+  },
+  "plugins": [
+    {
+      "name": "claude-messaging",
+      "description": "Register a Grok session as a peer on Claude Code's local cross-session messaging socket.",
+      "version": "0.2.0",
+      "category": "development",
+      "source": "./plugins/claude-messaging",
+      "keywords": [
+        "claude code",
+        "claude code session",
+        "list-agents",
+        "sendmessage",
+        "cross-session messaging"
+      ],
+      "homepage": "https://github.com/astersnake/grok-plugins/tree/main/plugins/claude-messaging"
+    }
+  ]
+}
