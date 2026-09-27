@@ -1,0 +1,3 @@
+Grok auto-updates plugins at session start, but it starts their MCP servers first, so a new version only runs from the session after the one that downloaded it.
+
+Seen 2026-09-27: the MCP server started at 18:29:32 on the old files and the update rewrote them at 18:29:36. A live test in that session looked like the fix had failed. Run `grok plugin update <name>` before opening the session you test in, and check which code the running server loaded, not just what is on disk. Never read `/proc/<server pid>/fd/1` to inspect it: that is the server's stdout pipe to Grok, so the read blocks and can steal MCP responses.

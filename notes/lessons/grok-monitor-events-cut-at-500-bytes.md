@@ -1,0 +1,3 @@
+Grok cuts each monitor notification after 500 bytes and appends `...(truncated)`, so a monitor event must fit in 500 bytes or the model sees half a message.
+
+Measured on Grok 1.0.41 from real transcripts: every truncated event showed exactly 500 bytes. In 0.2.0 the plugin sent any message under 4 KB whole and dropped it from the inbox, so a QA brief arrived cut and nothing held the rest. Grok then went hunting: it grepped the monitor's log, and in another session it opened the events FIFO with `f.read()`, which blocked (the monitor's `cat <>` keeps a writer open) and could have stolen messages from the monitor.
