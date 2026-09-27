@@ -40,8 +40,10 @@ WATCH_TTL = 12 * 60 * 60
 WAKE_GRACE = 15.0
 # Grok can end a turn and start the next queued one right after; wait that out.
 SETTLE = 2.0
-# Linux writes at most PIPE_BUF bytes to a FIFO atomically: all of it or nothing.
-PIPE_BUF = 4096
+# Grok shows at most 500 bytes of a monitor line and cuts the rest, so a longer
+# message goes out as a note and stays in read_inbox. 500 bytes is also well under
+# PIPE_BUF (4096), so each event is written to the FIFO atomically.
+EVENT_LIMIT = 500
 SOCKET_PATH_LIMIT = 103
 NAME_LIMIT = 64
 MODES = ("bypass", "prompting")
@@ -598,7 +600,7 @@ class Incoming:
         return row
 
     def note(self) -> dict[str, str]:
-        return {"from": self.sender, "note": f"{len(self.body)} characters; call read_inbox"}
+        return {"from": self.sender, "note": f"{len(self.body)} characters, too long for an event: call read_inbox"}
 
 
 @dataclass
@@ -911,10 +913,10 @@ class PeerRuntime:
                     kept.append(item)
                     continue
                 line = _event_line(item.row())
-                if len(line) <= PIPE_BUF and self._push(line):
+                if len(line) <= EVENT_LIMIT and self._push(line):
                     self._last_push = time.time()
                     continue
-                if len(line) > PIPE_BUF and self._push(_event_line(item.note())):
+                if len(line) > EVENT_LIMIT and self._push(_event_line(item.note())):
                     item.announced = True
                     kept.append(item)
                     continue

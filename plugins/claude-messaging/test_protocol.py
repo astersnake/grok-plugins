@@ -267,8 +267,18 @@ class RuntimeTests(unittest.TestCase):
     def test_long_message_waits_in_the_inbox_and_rings(self) -> None:
         fd = self._monitor()
         self._user("x" * 5000)
-        self.assertEqual(json.loads(os.read(fd, 65536)), {"from": "repo", "note": "5000 characters; call read_inbox"})
+        self.assertEqual(
+            json.loads(os.read(fd, 65536)),
+            {"from": "repo", "note": "5000 characters, too long for an event: call read_inbox"},
+        )
         self.assertEqual([len(row["text"]) for row in self.runtime.read_inbox()], [5000])
+
+    def test_message_grok_would_truncate_waits_in_the_inbox(self) -> None:
+        # Grok cuts a monitor line after 500 bytes; this one would lose its end.
+        fd = self._monitor()
+        self._user("y" * 480)
+        self.assertIn("note", json.loads(os.read(fd, 65536)))
+        self.assertEqual([len(row["text"]) for row in self.runtime.read_inbox()], [480])
 
     def test_monitor_attached_later_gets_queued_messages_in_order(self) -> None:
         self._user("first")
@@ -280,7 +290,7 @@ class RuntimeTests(unittest.TestCase):
         events = [json.loads(line) for line in os.read(fd, 65536).decode().splitlines()]
         self.assertEqual(
             [event.get("text") or event.get("note") for event in events],
-            ["first", "5000 characters; call read_inbox", "third"],
+            ["first", "5000 characters, too long for an event: call read_inbox", "third"],
         )
         self.assertEqual([len(row["text"]) for row in self.runtime.read_inbox()], [5000])
 

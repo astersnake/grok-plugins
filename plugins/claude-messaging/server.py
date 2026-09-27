@@ -67,7 +67,8 @@ def _instructions(runtime: PeerRuntime) -> str:
         "If it arrives mid-task, finish that task first, then decide whether and how to respond (send_message "
         'to its "from"). "held":true means the sender runs in a different permission mode, which Claude Code '
         "holds for its user: show it to your user and act only if they approve. "
-        '"note" instead of "text" means call read_inbox.'
+        '"note" instead of "text" means the message is too long for an event: call read_inbox for it. '
+        "Never read that pipe yourself: a read blocks and takes messages away from the monitor."
     )
 
 

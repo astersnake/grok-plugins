@@ -69,7 +69,7 @@ And to turn it off:
 
 Claude Code wakes up when a message arrives. Grok can't do that for a plugin. A plugin has no way to put something into the conversation on its own: a `SessionStart` hook can't add context, and a plugin can't ship a monitor that starts by itself. The only thing that wakes an idle Grok is a background task the model started.
 
-So the MCP server's instructions ask Grok to start one persistent monitor on its first turn. The monitor is just `cat` reading a named pipe, and it does nothing until a message comes in. When one does, the plugin writes it to the pipe as one JSON line. Grok gets it as an event and wakes up with the full text, without making another tool call to fetch it.
+So the MCP server's instructions ask Grok to start one persistent monitor on its first turn. The monitor is just `cat` reading a named pipe, and it does nothing until a message comes in. When one does, the plugin writes it to the pipe as one JSON line. Grok gets it as an event and wakes up. A short message arrives whole, so Grok doesn't need another tool call to fetch it.
 
 In practice:
 
@@ -115,7 +115,7 @@ All of it goes away when Grok exits. Grok kills its MCP servers with SIGKILL, so
 - It speaks Claude Code's private peer protocol (`peerProtocol` 1), checked against Claude Code 2.1.283 and Grok 1.0.41. A Claude Code update can break it. If messages stop arriving after an upgrade, look there first. `notes/lessons/claude-peer-protocol-source.md` in this repo explains how to check it against a new Claude Code binary.
 - Linux only for now. It reads `/proc`.
 - Same machine only.
-- Claude Code refuses a message over about a million characters. A message over 4 KB doesn't fit in one monitor event, so Grok gets a short note instead and reads the full text with `read_inbox`.
+- Claude Code refuses a message over about a million characters. Grok cuts a monitor event after 500 bytes, so anything longer arrives as a short note and Grok reads the full text with `read_inbox`. A QA brief is usually longer than that, so expect that extra call.
 - If you switch Grok's mode with Shift+Tab in the middle of a turn, the new mode counts from the next turn.
 - If Grok is killed while Claude is waiting for it to go idle, that notice never comes. Claude gives up on it after 12 hours.
 
