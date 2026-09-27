@@ -25,6 +25,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,13 @@ PROTOCOL_VERSION = 1
 ENTRYPOINT = "grok-claude-messaging"
 MAX_LINE = 1_048_576
 MAX_INBOX = 50
+# Claude Code's notify_when_idle limits: live subscriptions and how long one waits.
+MAX_WATCHERS = 32
+WATCH_TTL = 12 * 60 * 60
+# A message handed to the monitor starts a Grok turn within seconds.
+WAKE_GRACE = 15.0
+# Grok can end a turn and start the next queued one right after; wait that out.
+SETTLE = 2.0
 # Linux writes at most PIPE_BUF bytes to a FIFO atomically: all of it or nothing.
 PIPE_BUF = 4096
 SOCKET_PATH_LIMIT = 103
@@ -127,24 +135,104 @@ def grok_permission_class() -> str:
     mode cannot be read, so the envelope asserts none rather than guessing.
     """
     session = os.environ.get("GROK_SESSION_ID", "")
-    if not _SESSION_ID.fullmatch(session):
+    events = _grok_events_file()
+    if events is None:
         return ""
-    for events in (grok_home() / "sessions").glob(f"*/{session}/events.jsonl"):
-        try:
-            for line in _lines_from_end(events):
-                if '"turn_started"' not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if event.get("type") != "turn_started" or event.get("session_id") != session:
-                    continue
-                if isinstance(event.get("yolo_mode"), bool):
-                    return "bypass" if event["yolo_mode"] else "prompting"
-        except OSError:
-            continue
+    try:
+        for line in _lines_from_end(events):
+            if '"turn_started"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") != "turn_started" or event.get("session_id") != session:
+                continue
+            if isinstance(event.get("yolo_mode"), bool):
+                return "bypass" if event["yolo_mode"] else "prompting"
+    except OSError:
+        pass
     return ""
+
+
+def _grok_events_file() -> Path | None:
+    session = os.environ.get("GROK_SESSION_ID", "")
+    if not _SESSION_ID.fullmatch(session):
+        return None
+    return next((grok_home() / "sessions").glob(f"*/{session}/events.jsonl"), None)
+
+
+def _event_time(event: dict[str, Any]) -> float:
+    try:
+        return datetime.fromisoformat(str(event["ts"]).replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError):
+        return time.time()
+
+
+class TurnTracker:
+    """Follows this Grok session's events.jsonl to tell whether a turn is running.
+
+    It seeds from the latest turn event, then reads only what Grok appends.
+    Without a readable log the session always looks idle.
+    """
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.offset = 0
+        self.partial = b""
+        self.busy = False
+        self.last_event = 0.0
+        self.ended = 0.0
+
+    def poll(self) -> None:
+        if self.path is None:
+            self.path = _grok_events_file()
+            if self.path is None:
+                return
+            try:
+                self.offset = self.path.stat().st_size
+                for line in _lines_from_end(self.path):
+                    if '"turn_' in line and self._apply(line):
+                        break
+            except OSError:
+                self.path = None
+                return
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(self.offset)
+                data = handle.read()
+        except OSError:
+            return
+        self.offset += len(data)
+        lines = (self.partial + data).split(b"\n")
+        self.partial = lines.pop()
+        for line in lines:
+            if b'"turn_' in line:
+                self._apply(line.decode(errors="replace"))
+
+    def _apply(self, line: str) -> bool:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        kind = event.get("type") if isinstance(event, dict) else None
+        if kind == "turn_started" and event.get("session_id") == os.environ.get("GROK_SESSION_ID"):
+            self.busy = True
+        elif kind == "turn_ended":
+            self.busy = False
+            self.ended = _event_time(event)
+        else:
+            return False
+        self.last_event = _event_time(event)
+        return True
+
+    def settled(self, now: float, last_push: float) -> bool:
+        """Idle the way Claude Code means it: no turn running and none about to start."""
+        if self.busy:
+            return False
+        if last_push > self.last_event and now - last_push < WAKE_GRACE:
+            return False
+        return not self.ended or now - self.ended >= SETTLE
 
 
 def parity_hold(from_mode: str, own_class: str) -> bool:
@@ -538,6 +626,9 @@ class PeerRuntime:
     _receipts: dict[str, Receipt] = field(default_factory=dict)
     _janitor: subprocess.Popen[bytes] | None = None
     _janitor_fd: int = -1
+    _turns: TurnTracker = field(default_factory=TurnTracker)
+    _watchers: list[tuple[str, str, float]] = field(default_factory=list)
+    _last_push: float = 0.0
     _closed: bool = False
 
     @classmethod
@@ -629,6 +720,10 @@ class PeerRuntime:
             if self._closed:
                 return
             self._closed = True
+            watchers, self._watchers = self._watchers, []
+        # Only a graceful stop gets here; after Grok's SIGKILL a subscription lapses.
+        for address, msg_id, _ in watchers:
+            self._send_idle_notice(address, msg_id, "exited", time.time())
         self._stop.set()
         self._server.close()
         self._thread.join(timeout=2)
@@ -734,6 +829,7 @@ class PeerRuntime:
             except TimeoutError:
                 # Replays what arrived before a monitor attached, within one tick.
                 self._flush()
+                self._check_idle()
                 continue
             except OSError:
                 return
@@ -816,6 +912,7 @@ class PeerRuntime:
                     continue
                 line = _event_line(item.row())
                 if len(line) <= PIPE_BUF and self._push(line):
+                    self._last_push = time.time()
                     continue
                 if len(line) > PIPE_BUF and self._push(_event_line(item.note())):
                     item.announced = True
@@ -841,7 +938,12 @@ class PeerRuntime:
             return
         if action == "notify_when_idle":
             msg_id = str(frame.get("msg_id") or "")
-            self._send_idle_notice(sender, msg_id)
+            if not sender.startswith("uds:") or not msg_id:
+                return
+            with self._lock:
+                # A new request from the same session replaces its old one.
+                kept = [watcher for watcher in self._watchers if watcher[0] != sender]
+                self._watchers = kept[-(MAX_WATCHERS - 1) :] + [(sender, msg_id, time.time())]
             return
         # peer_idle_notice answers a notify_when_idle this peer never sends.
 
@@ -860,23 +962,37 @@ class PeerRuntime:
             frame["status_detail"] = detail
         _send_raw(sender, frame)
 
-    def _send_idle_notice(self, sender: str, msg_id: str) -> None:
-        if not sender.startswith("uds:") or not msg_id:
+    def _check_idle(self) -> None:
+        """Answer notify_when_idle once Grok's current turn, and any it owes, is over."""
+        if not self._watchers:
             return
-        _send_raw(
-            sender,
-            {
-                "msgV": PROTOCOL_VERSION,
-                "type": "control",
-                "action": "peer_idle_notice",
-                "msg_id": str(uuid.uuid4()),
-                "orig_msg_id": msg_id,
-                "from": self.address,
-                "state": "idle",
-                "finished_at": int(time.time() * 1000),
-                "from_mode": "prompting",
-            },
-        )
+        self._turns.poll()
+        now = time.time()
+        with self._lock:
+            self._watchers = [watcher for watcher in self._watchers if now - watcher[2] < WATCH_TTL]
+            if not self._watchers or not self._turns.settled(now, self._last_push):
+                return
+            watchers, self._watchers = self._watchers, []
+        for address, msg_id, _ in watchers:
+            self._send_idle_notice(address, msg_id, "idle", self._turns.ended)
+
+    def _send_idle_notice(self, sender: str, msg_id: str, state: str, finished_at: float) -> None:
+        frame: dict[str, Any] = {
+            "msgV": PROTOCOL_VERSION,
+            "type": "control",
+            "action": "peer_idle_notice",
+            "msg_id": str(uuid.uuid4()),
+            "orig_msg_id": msg_id,
+            "from": self.address,
+            "state": state,
+        }
+        # Like Claude Code, give finished_at only when a turn is known to have ended.
+        if finished_at:
+            frame["finished_at"] = int(finished_at * 1000)
+        mode = grok_permission_class()
+        if mode:
+            frame["from_mode"] = mode
+        _send_raw(sender, frame)
 
 
 def _spawn_janitor(paths: list[Path]) -> tuple[int, subprocess.Popen[bytes]]:

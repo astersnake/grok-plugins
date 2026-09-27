@@ -56,7 +56,7 @@ session, tell me instead of skipping QA.
 
 A couple of things I learned using it:
 
-- Ask Grok to report back. Don't count on `notify_when_idle`: the plugin can't tell when Grok finishes a turn, so it answers that request right away.
+- Ask Grok to report back. If you also want Claude to know when Grok is done, even when Grok doesn't write, ask Claude to get notified when the Grok session goes idle. The plugin watches Grok's turns and answers when the work ends, the way a Claude session would.
 - If you have more than one Grok session open, say which one. Otherwise Claude has to guess.
 
 And to turn it off:
@@ -117,6 +117,7 @@ All of it goes away when Grok exits. Grok kills its MCP servers with SIGKILL, so
 - Same machine only.
 - Claude Code refuses a message over about a million characters. A message over 4 KB doesn't fit in one monitor event, so Grok gets a short note instead and reads the full text with `read_inbox`.
 - If you switch Grok's mode with Shift+Tab in the middle of a turn, the new mode counts from the next turn.
+- If Grok is killed while Claude is waiting for it to go idle, that notice never comes. Claude gives up on it after 12 hours.
 
 ## Tests
 

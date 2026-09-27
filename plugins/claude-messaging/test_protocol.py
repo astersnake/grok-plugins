@@ -15,6 +15,7 @@ import textwrap
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -172,14 +173,7 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.runtime.close)
 
     def _listener(self) -> tuple[socket.socket, str]:
-        path = str(_root() / "run" / f"capture-{uuid.uuid4().hex[:8]}.sock")
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(path)
-        server.listen(1)
-        server.settimeout(0.3)
-        self.addCleanup(os.unlink, path)
-        self.addCleanup(server.close)
-        return server, encode_address(path)
+        return _listener(self)
 
     def _frame(self, **fields: Any) -> str:
         return json.dumps({"msgV": 1, "msg_id": str(uuid.uuid4()), **fields})
@@ -213,19 +207,6 @@ class RuntimeTests(unittest.TestCase):
         assert receipt is not None
         self.assertEqual(receipt.status, "refused")
         self.assertEqual(receipt.detail, "The recipient session is not accepting cross-session messages.")
-
-    def test_idle_notice_uses_epoch_milliseconds(self) -> None:
-        listener, address = self._listener()
-        msg_id = str(uuid.uuid4())
-        before = int(time.time() * 1000)
-        self.runtime._on_line(self._frame(type="control", action="notify_when_idle", msg_id=msg_id, **{"from": address}))
-        after = int(time.time() * 1000)
-        connection, _ = listener.accept()
-        with connection:
-            notice = json.loads(connection.makefile().readline())
-        self.assertEqual(notice["orig_msg_id"], msg_id)
-        self.assertIsInstance(notice["finished_at"], int)
-        self.assertTrue(before <= notice["finished_at"] <= after)
 
     def test_uncorrelated_idle_notice_is_ignored(self) -> None:
         self.runtime._on_line(
@@ -333,6 +314,111 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([path for path in paths if not path.exists()], [])
         self.runtime.close()
         self.assertEqual([path for path in paths if path.exists()], [])
+
+
+class IdleNoticeTests(unittest.TestCase):
+    """notify_when_idle answers when Grok's turn is over, as Claude Code does."""
+
+    session = "01a0e489-855d-7563-b344-2deb911b7777"
+
+    def setUp(self) -> None:
+        directory = _root() / "grok" / "sessions" / "%2Ftmp%2Fidle" / self.session
+        directory.mkdir(parents=True, exist_ok=True)
+        self.events = directory / "events.jsonl"
+        self.events.write_text("")
+        self.addCleanup(self.events.unlink)
+        for patcher in (
+            mock.patch.dict(os.environ, {"GROK_SESSION_ID": self.session}),
+            mock.patch.object(protocol, "SETTLE", 0.0),
+            mock.patch.object(protocol, "WAKE_GRACE", 5.0),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.runtime = PeerRuntime.start(cwd=str(_root()))
+        self.addCleanup(self.runtime.close)
+
+    def _event(self, kind: str, at: float | None = None) -> float:
+        at = at or time.time()
+        stamp = datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        event: dict[str, Any] = {"ts": stamp, "type": kind}
+        if kind == "turn_started":
+            event.update(session_id=self.session, yolo_mode=True)
+        with self.events.open("a") as handle:
+            handle.write(json.dumps(event) + "\n")
+        return at
+
+    def _subscribe(self, listener: tuple[socket.socket, str] | None = None) -> tuple[socket.socket, str, str]:
+        server, address = listener or _listener(self)
+        msg_id = str(uuid.uuid4())
+        frame = {"msgV": 1, "type": "control", "action": "notify_when_idle", "msg_id": msg_id, "from": address}
+        self.runtime._on_line(json.dumps(frame))
+        return server, address, msg_id
+
+    def _notice(self, server: socket.socket) -> dict[str, Any] | None:
+        self.runtime._check_idle()
+        try:
+            connection, _ = server.accept()
+        except TimeoutError:
+            return None
+        with connection:
+            return json.loads(connection.makefile().readline())
+
+    def test_waits_while_a_turn_runs(self) -> None:
+        self._event("turn_started")
+        server, _, msg_id = self._subscribe()
+        self.assertIsNone(self._notice(server))
+        ended = self._event("turn_ended")
+        notice = self._notice(server)
+        assert notice is not None
+        self.assertEqual((notice["orig_msg_id"], notice["state"]), (msg_id, "idle"))
+        self.assertLessEqual(abs(notice["finished_at"] - int(ended * 1000)), 1)
+        self.assertEqual(notice["from_mode"], "bypass")
+
+    def test_answers_at_once_when_idle(self) -> None:
+        self._event("turn_started")
+        self._event("turn_ended")
+        server, _, _ = self._subscribe()
+        self.assertEqual((self._notice(server) or {}).get("state"), "idle")
+
+    def test_a_delivered_message_is_work_still_owed(self) -> None:
+        self._event("turn_started")
+        self._event("turn_ended")
+        fd = os.open(self.runtime.events_path, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, fd)
+        envelope = render_envelope(sender="uds:/tmp/x.sock", body="run the QA pass", from_name="repo", from_mode="bypass")
+        self.runtime._on_line(json.dumps({"msgV": 1, "type": "user", "message": {"role": "user", "content": envelope}}))
+        server, _, _ = self._subscribe()
+        self.assertIsNone(self._notice(server))
+        self._event("turn_started")
+        self.assertIsNone(self._notice(server))
+        self._event("turn_ended")
+        self.assertEqual((self._notice(server) or {}).get("state"), "idle")
+
+    def test_without_a_turn_log_answers_at_once(self) -> None:
+        with mock.patch.dict(os.environ, {"GROK_SESSION_ID": ""}):
+            server, _, _ = self._subscribe()
+            notice = self._notice(server)
+        assert notice is not None
+        self.assertEqual(notice["state"], "idle")
+        self.assertNotIn("finished_at", notice)
+
+    def test_same_requester_replaces_its_subscription(self) -> None:
+        self._event("turn_started")
+        listener = _listener(self)
+        self._subscribe(listener)
+        _, _, latest = self._subscribe(listener)
+        self._event("turn_ended")
+        self.assertEqual((self._notice(listener[0]) or {}).get("orig_msg_id"), latest)
+        self.assertIsNone(self._notice(listener[0]))
+
+    def test_close_tells_watchers_the_session_exited(self) -> None:
+        self._event("turn_started")
+        server, _, msg_id = self._subscribe()
+        self.runtime.close()
+        connection, _ = server.accept()
+        with connection:
+            notice = json.loads(connection.makefile().readline())
+        self.assertEqual((notice["orig_msg_id"], notice["state"]), (msg_id, "exited"))
 
 
 class ParityTests(unittest.TestCase):
@@ -512,6 +598,18 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(responses[0]["result"]["isError"])
         self.assertIn("peer went away", responses[0]["result"]["content"][0]["text"])
         self.assertEqual(responses[1], {"jsonrpc": "2.0", "id": 2, "result": {}})
+
+
+def _listener(test: unittest.TestCase) -> tuple[socket.socket, str]:
+    """A socket standing in for a Claude session, to capture what the peer sends back."""
+    path = str(_root() / "run" / f"capture-{uuid.uuid4().hex[:8]}.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen(4)
+    server.settimeout(0.3)
+    test.addCleanup(os.unlink, path)
+    test.addCleanup(server.close)
+    return server, encode_address(path)
 
 
 def _peer_from_snapshot(info: dict) -> protocol.Peer:
