@@ -1,0 +1,7 @@
+{
+  "name": "claude-messaging",
+  "description": "Register a Grok session as a Claude Code cross-session messaging peer.",
+  "version": "0.2.0",
+  "homepage": "https://github.com/astersnake/grok-plugins/tree/main/plugins/claude-messaging",
+  "license": "MIT"
+}
