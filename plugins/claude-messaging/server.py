@@ -11,7 +11,7 @@ from typing import Any
 from protocol import PeerRuntime, ProtocolError, describe_peers, resolve_peer
 
 SERVER_NAME = "claude-messaging"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.2.2"
 
 
 def _read_message() -> dict[str, Any] | None:
