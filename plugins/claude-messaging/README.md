@@ -34,6 +34,37 @@ From Grok, just ask: "which Claude sessions are open?", "send the results to my-
 
 When Grok sends, the receipt is usually `unconfirmed`. That's normal: Claude Code sends nothing back when it accepts a message. `held` means the message is waiting for you to approve it on the Claude side (see below). `refused`, `expired`, or `dropped` means it didn't get through.
 
+## Telling Claude to use it
+
+Claude doesn't message other sessions on its own. It does it when you ask, or when the project's `CLAUDE.md` tells it to. The tools on the Claude side are `ListAgents` and `SendMessage`, but you don't need to name them. Plain words work:
+
+> Send this QA pass to grok-my-app-3f and wait for its report: checkout flow on staging, try an expired card and a coupon.
+
+Claude finds the session and sends it. Grok's answer shows up in Claude's conversation as a message, even if Claude was idle by then.
+
+If you want Claude to hand QA to Grok without asking every time, put something like this in the project's `CLAUDE.md`:
+
+```markdown
+## QA with Grok
+
+When a change is ready for QA, run ListAgents and look for a session whose
+name starts with `grok-`. Send it the QA pass with SendMessage: what changed,
+how to run it, and what to check. Ask it to report back with send_message.
+Wait for that report before calling the task done. If there's no grok-
+session, tell me instead of skipping QA.
+```
+
+A couple of things I learned using it:
+
+- Ask Grok to report back. Don't count on `notify_when_idle`: the plugin can't tell when Grok finishes a turn, so it answers that request right away.
+- If you have more than one Grok session open, say which one. Otherwise Claude has to guess.
+
+And to turn it off:
+
+- Claude won't send anything unless you or a `CLAUDE.md` ask it to. Drop the block and it stops.
+- To stop a Claude session from receiving messages, set "Messages from your other sessions" in `/config` (the `crossSessionInbound` setting) to `hold` or `refuse`. See Claude Code's [cross-session messaging docs](https://code.claude.com/docs/en/cross-session-messaging).
+- On the Grok side, stop the monitor (next section).
+
 ## Why Grok starts a monitor on its first turn
 
 Claude Code wakes up when a message arrives. Grok can't do that for a plugin. A plugin has no way to put something into the conversation on its own: a `SessionStart` hook can't add context, and a plugin can't ship a monitor that starts by itself. The only thing that wakes an idle Grok is a background task the model started.
